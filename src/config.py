@@ -8,14 +8,19 @@ from dotenv import load_dotenv
 # 加载 .env 文件
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+# 设置 Hugging Face 镜像（解决国内无法访问 huggingface.co 的问题）
+if os.getenv("HF_ENDPOINT"):
+    os.environ["HF_ENDPOINT"] = os.getenv("HF_ENDPOINT")
+
 # ---- 项目路径 ----
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 PAPERS_DIR = DATA_DIR / "papers"
 CHROMA_DIR = DATA_DIR / "chroma_db"
+CONVERSATIONS_DIR = DATA_DIR / "conversations"
 
 # 确保目录存在
-for d in [DATA_DIR, PAPERS_DIR, CHROMA_DIR]:
+for d in [DATA_DIR, PAPERS_DIR, CHROMA_DIR, CONVERSATIONS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ---- LLM 配置 (DeepSeek / OpenAI 兼容) ----
@@ -37,7 +42,7 @@ CHROMA_COLLECTION_NAME = "arxiv_papers"
 
 # ---- 爬虫配置 ----
 ARXIV_CRAWL_INTERVAL_HOURS = int(os.getenv("ARXIV_CRAWL_INTERVAL_HOURS", "24"))
-ARXIV_MAX_RESULTS_PER_FETCH = int(os.getenv("ARXIV_MAX_RESULTS_PER_FETCH", "100"))
+ARXIV_MAX_RESULTS_PER_FETCH = int(os.getenv("ARXIV_MAX_RESULTS_PER_FETCH", "20"))
 ARXIV_REQUEST_DELAY = 3.0  # arXiv API 限速间隔(秒)
 
 # ---- 领域配置 ----
@@ -53,8 +58,12 @@ RESEARCH_DOMAINS = {
 }
 
 # ---- 分块配置 ----
+# 章节感知分块：基准字符数，实际按章节→段落边界切分
 CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+
+# ---- Gemini 多模态配置 (图片理解，可选) ----
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # ---- API 配置 ----
 API_HOST = "0.0.0.0"

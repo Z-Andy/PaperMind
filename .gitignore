@@ -12,6 +12,13 @@ __pycache__/
 # 运行时数据（论文 PDF、向量数据库——体积大，不应上传）
 data/
 
+# 评估结果文件
+qasper_*.json
+*.results.json
+
+# 详细开发文档（仅本地保留）
+README_DEV.md
+
 # IDE 配置
 .vscode/
 .idea/

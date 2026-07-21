@@ -7,7 +7,7 @@ from typing import Optional
 
 from src.config import PAPERS_DIR
 from src.rag.document_processor import DocumentProcessor, Document
-from src.rag.chunker import TextChunker, Chunk
+from src.rag.chunker import SectionChunker, Chunk
 from src.rag.embedder import Embedder
 from src.rag.vector_store import VectorStore
 from src.rag.retriever import Retriever
@@ -28,7 +28,7 @@ class RAGPipeline:
         self.embedder = embedder
         self.papers_dir = Path(papers_dir)
         self.processor = DocumentProcessor()
-        self.chunker = TextChunker()
+        self.chunker = SectionChunker()
         self.retriever = Retriever(vector_store, embedder)
 
     def ingest_papers(

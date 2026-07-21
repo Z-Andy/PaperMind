@@ -1,16 +1,19 @@
 """
 FastAPI 后端服务：提供 RESTful API 接口。
 """
+import json
 import logging
 import asyncio
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.config import API_HOST, API_PORT
 from src.agents.system import get_system, MultiAgentSystem
+from src.metrics import get_metrics
 
 # 配置日志
 logging.basicConfig(
@@ -41,10 +44,14 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str = Field(..., description="用户提问")
     enable_review: bool = Field(default=True, description="是否启用审查Agent复核")
+    conversation_id: Optional[str] = Field(
+        default=None, description="多轮对话ID，同一会话使用相同ID以保持上下文"
+    )
 
 
 class CrawlRequest(BaseModel):
     domain: Optional[str] = Field(default=None, description="指定领域（空=全部）")
+    max_results: int = Field(default=20, ge=1, le=200, description="每个领域最多爬取篇数")
     schedule: bool = Field(default=False, description="是否启用定时调度")
 
 
@@ -87,15 +94,29 @@ async def root():
     }
 
 
+@app.get("/health")
+async def health():
+    """健康检查：验证 LLM API 和知识库状态"""
+    if system is None:
+        return {"status": "initializing", "llm": None, "kb_size": 0}
+    result = system.check_health()
+    result["status"] = "healthy" if not result["issues"] else "degraded"
+    return result
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
     """用户提问接口：检索 → 分析 → 审查 → 综合回答"""
     if system is None:
         raise HTTPException(503, "系统尚未初始化")
 
+    health = system.check_health()
+    if health["kb_size"] == 0:
+        raise HTTPException(400, "知识库为空，请先更新知识库后再提问")
+
     try:
         answer = await asyncio.to_thread(
-            system.query, req.question, req.enable_review
+            system.query, req.question, req.enable_review, req.conversation_id
         )
         return QueryResponse(
             answer=answer,
@@ -106,6 +127,15 @@ async def query(req: QueryRequest):
         raise HTTPException(500, f"查询处理失败: {str(e)}")
 
 
+@app.post("/crawl/cancel")
+async def cancel_crawl():
+    """取消正在进行的论文爬取"""
+    if system is None:
+        raise HTTPException(503, "系统尚未初始化")
+    system.crawler.cancel()
+    return {"message": "已发送取消信号，爬取将在当前下载完成后停止"}
+
+
 @app.post("/crawl")
 async def trigger_crawl(req: CrawlRequest):
     """手动触发论文爬取"""
@@ -114,9 +144,13 @@ async def trigger_crawl(req: CrawlRequest):
 
     try:
         if req.domain:
-            result = await asyncio.to_thread(system.crawl_domain, req.domain)
+            result = await asyncio.to_thread(
+                system.crawl_domain, req.domain, req.max_results
+            )
         else:
-            result = await asyncio.to_thread(system.update_knowledge_base)
+            result = await asyncio.to_thread(
+                system.update_knowledge_base, None, req.max_results
+            )
 
         return {"message": "爬取完成", "result": result}
     except Exception as e:
@@ -153,6 +187,20 @@ async def get_stats():
     )
 
 
+@app.get("/metrics")
+async def get_metrics_endpoint():
+    """获取性能指标：响应时间、缓存命中率、各步骤耗时分布"""
+    metrics = get_metrics()
+    return metrics.get_summary()
+
+
+@app.get("/metrics/recent")
+async def get_recent_queries(limit: int = 20):
+    """获取最近 N 条查询的明细日志"""
+    metrics = get_metrics()
+    return {"queries": metrics.get_recent_queries(limit)}
+
+
 @app.post("/scheduler/start")
 async def start_scheduler():
     """启动定时爬虫"""
@@ -172,6 +220,33 @@ async def stop_scheduler():
 
     system.stop_scheduler()
     return {"message": "定时爬虫已停止"}
+
+
+@app.post("/query/stream")
+async def query_stream(req: QueryRequest):
+    """流式查询接口 (SSE)：逐 Agent 返回进度和最终结果"""
+    if system is None:
+        raise HTTPException(503, "系统尚未初始化")
+
+    async def event_generator():
+        try:
+            async for event in system.query_stream(
+                req.question, req.enable_review, req.conversation_id
+            ):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"流式查询失败: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ---- 启动入口 ----

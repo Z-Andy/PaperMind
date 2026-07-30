@@ -353,35 +353,54 @@ def evaluate_qasper(split: str = "validation", max_samples: int = 100):
         paper_id = row.get("id", "unknown")
 
         # 构建论文全文
+        # full_text.paragraphs = [[sec_name, [para_str, ...], ...], ...]
         full_text_parts = []
         if row.get("full_text"):
             ft = row["full_text"]
-            paras = ft.get("paragraphs", [])
-            for sec_paras in paras:
-                for para in sec_paras:
-                    full_text_parts.append(para)
+            for sec_data in ft.get("paragraphs", []):
+                # sec_data[0] 是 section 名称, 后面是段落列表
+                for item in sec_data[1:]:
+                    if isinstance(item, list):
+                        full_text_parts.extend(item)
+                    elif isinstance(item, str):
+                        full_text_parts.append(item)
 
         full_text = "\n".join(full_text_parts)
         if not full_text:
             skipped_no_text += 1
             continue
 
-        # QASPER 每行是一个 QA 对
+        # QASPER: question 是 list[str], answers 按索引对应
         qas = row.get("qas", {})
-        question = qas.get("question", "") if isinstance(qas, dict) else ""
-        answers = qas.get("answers", []) if isinstance(qas, dict) else []
+        questions = qas.get("question", []) if isinstance(qas, dict) else []
+        answers_list = qas.get("answers", []) if isinstance(qas, dict) else []
 
-        if not question or not answers:
+        if not isinstance(questions, list) or not answers_list:
             continue
 
-        # 提取 evidence 文本
-        evidence_texts = set()
-        for ans in answers:
-            if not isinstance(ans, dict):
+        # 对每个问题单独评估
+        for idx, question in enumerate(questions):
+            if processed >= max_samples:
+                break
+            if idx >= len(answers_list):
                 continue
-            ans_data = ans.get("answer", ans)
-            if isinstance(ans_data, dict):
-                for ev in ans_data.get("evidence", []):
+
+            ans_entry = answers_list[idx]
+            if not isinstance(ans_entry, dict):
+                continue
+
+            # answer 内层是 list（多个 annotator 的答案）
+            inner_answers = ans_entry.get("answer", [])
+            if not isinstance(inner_answers, list):
+                inner_answers = [inner_answers]
+
+            # 取第一个 annotator 的 evidence
+            evidence_texts = set()
+            for ia in inner_answers:
+                if not isinstance(ia, dict):
+                    continue
+                # evidence 可能是 str 列表或 dict 列表
+                for ev in ia.get("evidence", []):
                     if isinstance(ev, str) and ev.strip():
                         evidence_texts.add(ev.strip()[:300])
                     elif isinstance(ev, dict):
@@ -389,54 +408,71 @@ def evaluate_qasper(split: str = "validation", max_samples: int = 100):
                         if t and isinstance(t, str):
                             evidence_texts.add(t.strip()[:300])
 
-        if not evidence_texts:
-            skipped_no_evidence += 1
-            continue
+            if not evidence_texts:
+                skipped_no_evidence += 1
+                continue
 
-        # 检索
-        paragraphs = [p.strip() for p in full_text.split("\n") if len(p.strip()) > 50]
-        if len(paragraphs) < 3:
-            continue
+            # 在论文段落中用 BM25 检索
+            paragraphs = [p.strip() for p in full_text.split("\n") if len(p.strip()) > 50]
+            if len(paragraphs) < 3:
+                continue
 
-        from rank_bm25 import BM25Okapi
-        tokenized_paras = [p.lower().split() for p in paragraphs]
-        bm25 = BM25Okapi(tokenized_paras)
-        scores = bm25.get_scores(question.lower().split())
-        max_k = max(k_values)
-        if len(scores) < max_k:
-            max_k = len(scores)
-        ranked_indices = sorted(
-            range(len(scores)), key=lambda i: scores[i], reverse=True
-        )[:max_k]
+            from rank_bm25 import BM25Okapi
+            tokenized_paras = [p.lower().split() for p in paragraphs]
+            bm25 = BM25Okapi(tokenized_paras)
+            scores = bm25.get_scores(question.lower().split())
+            max_k = max(k_values)
+            if len(scores) < max_k:
+                max_k = len(scores)
+            ranked_indices = sorted(
+                range(len(scores)), key=lambda i: scores[i], reverse=True
+            )[:max_k]
 
-        retrieved_paras = [paragraphs[i] for i in ranked_indices]
+            retrieved_paras = [paragraphs[i] for i in ranked_indices]
 
-        def _is_relevant(retrieved_text):
-            r = retrieved_text[:200].strip()
-            for ev in evidence_texts:
-                if r[:80] in ev or ev[:80] in r:
-                    return True
-            return False
+            # 改进的 relevance 判断: evidence 片段出现在段落任意位置
+            def _is_relevant(retrieved_text):
+                r_text = retrieved_text.lower()
+                for ev in evidence_texts:
+                    ev_lower = ev.lower()
+                    if len(ev_lower) < 30:
+                        # 短 evidence: 精确匹配
+                        if ev_lower in r_text:
+                            return True
+                    else:
+                        # 长 evidence: 取前 60 字符滑动匹配
+                        ev_prefix = ev_lower[:60]
+                        if ev_prefix in r_text:
+                            return True
+                        # 也尝试 r_text 前 100 字符 in ev
+                        if r_text[:100] in ev_lower:
+                            return True
+                return False
 
-        relevant_ids = set(
-            str(i) for i, p in enumerate(retrieved_paras) if _is_relevant(p)
-        )
+            relevant_ids = set(
+                str(i) for i, p in enumerate(retrieved_paras) if _is_relevant(p)
+            )
 
-        item = {"id": f"{paper_id}_q0", "question": question[:80]}
-        for k in k_values:
-            item[f"recall@{k}"] = round(
-                compute_recall_at_k(
-                    [str(j) for j in ranked_indices[:k]], relevant_ids, k
+            item = {"id": f"{paper_id}_q{idx}", "question": question[:80]}
+            for k in k_values:
+                item[f"recall@{k}"] = round(
+                    compute_recall_at_k(
+                        [str(j) for j in ranked_indices[:k]], relevant_ids, k
+                    ), 3
+                )
+            item["mrr"] = round(
+                compute_mrr([str(j) for j in ranked_indices], relevant_ids), 3
+            )
+            item["ndcg@10"] = round(
+                compute_ndcg_at_k(
+                    [str(j) for j in ranked_indices[:10]], relevant_ids, 10
                 ), 3
             )
-        item["mrr"] = round(
-            compute_mrr([str(j) for j in ranked_indices], relevant_ids), 3
-        )
-        results.append(item)
-        processed += 1
+            results.append(item)
+            processed += 1
 
-        if processed % 20 == 0:
-            logger.info(f"  已评估 {processed} 个问题...")
+            if processed % 20 == 0:
+                logger.info(f"  已评估 {processed} 个问题...")
 
     # 汇总
     logger.info(
@@ -447,7 +483,7 @@ def evaluate_qasper(split: str = "validation", max_samples: int = 100):
         print("\n" + "=" * 60)
         print(f"QASPER 检索质量评估 ({split}, n={len(results)})")
         print("=" * 60)
-        for metric in ["recall@3", "recall@5", "recall@10", "mrr"]:
+        for metric in ["recall@3", "recall@5", "recall@10", "mrr", "ndcg@10"]:
             values = [r[metric] for r in results if metric in r]
             if values:
                 avg = sum(values) / len(values)

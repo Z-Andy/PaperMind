@@ -23,8 +23,9 @@ streamlit run src/ui/app.py     # 端口 8501
 ```
 
 - **检索**：直接混合检索（不经过 LLM Agent），BM25 + 向量语义 + RRF 融合 + Cross-Encoder 重排序
-- **问答**：多轮对话支持 + 查询改写（如"那显存呢？"→"LoRA 显存占用"）
+- **问答**：多轮对话 + 查询改写 + 分层记忆（L1/L2/L3）+ Sub-Agent 工作集管理
 - **知识库**：本地 Embedding（bge-small-zh-v1.5）+ ChromaDB + Gemini 图片理解（可选）
+- **上下文**：自适应预算（根据 LLM 窗口动态分配），Reviewer 独立事实核查
 
 ## 技术栈
 

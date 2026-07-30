@@ -65,6 +65,27 @@ CHUNK_SIZE = 1000
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
+# ---- 上下文管理配置 ----
+# LLM 上下文窗口上限（deepseek-chat = 128K）
+LLM_MAX_CONTEXT_TOKENS = int(os.getenv("LLM_MAX_CONTEXT_TOKENS", "128000"))
+# 窗口安全系数：预留 30% 给模型输出
+CONTEXT_SAFE_RATIO = 0.7
+# 自适应预算分配比例（总可用上下文 = LLM_MAX_CONTEXT_TOKENS * CONTEXT_SAFE_RATIO）
+CONTEXT_BUDGET_L1_RATIO = 0.15    # L1 工作记忆（最近 N 轮完整保留）
+CONTEXT_BUDGET_L2_RATIO = 0.10    # L2 中期记忆（压缩后的结构化要点）
+CONTEXT_BUDGET_RETRIEVAL_RATIO = 0.45  # 检索结果 / 工作集摘要
+CONTEXT_BUDGET_RESERVE_RATIO = 0.30    # 预留给 Agent 输出 + 任务描述
+
+# 分层记忆容量
+L1_WORKING_ROUNDS = 5          # L1 工作记忆保留的最近轮数
+L2_MEDIUM_ROUNDS = 20          # L2 中期记忆最多保留的轮数（压缩后）
+L3_PINNED_MAX = 20             # L3 用户置顶笔记最多条数
+MEMORY_COMPRESSION_TOKENS = 150  # 压缩每条旧轮次时 LLM 输出上限
+
+# 工作集 (Working Set) 配置
+WORKING_SET_MAX_FRAGMENTS = 8    # FIFO 队列最大容量
+WORKING_SET_RELEVANCE_THRESHOLD = 0.6  # 向量相似度命中阈值
+
 # ---- API 配置 ----
 API_HOST = "0.0.0.0"
 API_PORT = int(os.getenv("API_PORT", "8000"))

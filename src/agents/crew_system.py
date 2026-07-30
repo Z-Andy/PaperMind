@@ -1,6 +1,13 @@
 """
 CrewAI 多 Agent 协作系统：替代手写 Agent 流程。
 使用 CrewAI 框架管理 Agent 角色、任务编排和协作。
+
+上下文管理策略：
+  L1 工作记忆 - 最近 N 轮完整保留（默认 5 轮）
+  L2 中期记忆 - 旧轮次压缩为结构化要点（LLM 提取关键事实）
+  L3 长期笔记 - 用户手动置顶的关键结论（跨会话持久化）
+  WorkingSet  - Sub-Agent FIFO 队列，管理当前讨论中引用的论文片段
+  自适应预算 - 根据 LLM 窗口大小动态分配各级预算
 """
 import hashlib
 import json
@@ -15,6 +22,11 @@ from crewai import Agent, Task, Crew, Process, LLM
 
 from src.config import (
     LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, CONVERSATIONS_DIR,
+    L1_WORKING_ROUNDS, L2_MEDIUM_ROUNDS, L3_PINNED_MAX,
+    MEMORY_COMPRESSION_TOKENS,
+    LLM_MAX_CONTEXT_TOKENS, CONTEXT_SAFE_RATIO,
+    CONTEXT_BUDGET_L1_RATIO, CONTEXT_BUDGET_L2_RATIO,
+    CONTEXT_BUDGET_RETRIEVAL_RATIO, CONTEXT_BUDGET_RESERVE_RATIO,
 )
 from src.crawler import ArxivCrawler
 from src.crawler.scheduler import CrawlScheduler
@@ -24,6 +36,7 @@ from src.rag.vector_store import VectorStore
 from src.rag.pipeline import RAGPipeline
 from src.rag.retriever import Retriever
 from src.agents.tools import RetrievePapersTool
+from src.agents.working_set import WorkingSetManager, Fragment, RelevanceResult
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +79,15 @@ class CrewMultiAgentSystem:
 
         # ---- 多轮对话存储 ----
         self._conversations: dict[str, list[dict]] = {}
+        # L2 压缩记忆: {conversation_id: str}
+        self._compressed_memories: dict[str, str] = {}
+        # L3 用户置顶笔记: {conversation_id: list[str]}
+        self._pinned_notes: dict[str, list[str]] = {}
+        # 已压缩到的轮次索引（避免重复压缩）
+        self._compressed_until: dict[str, int] = {}
+
+        # ---- Sub-Agent 工作集管理器 ----
+        self.working_set = WorkingSetManager(embedder=self.embedder)
 
         # ---- 查询结果缓存 ----
         self._query_cache: OrderedDict[str, str] = OrderedDict()
@@ -307,93 +329,271 @@ class CrewMultiAgentSystem:
             self._query_cache.popitem(last=False)
 
     # ========================
-    # 多轮对话管理（含持久化、查询改写、上下文预算）
+    # 自适应上下文预算
     # ========================
-
-    # 上下文预算（字符数）：总 prompt 控制在 LLM 窗口安全范围内
-    _HISTORY_BUDGET_CHARS = 2000   # 对话历史最大字符数
-    _RETRIEVAL_BUDGET_CHARS = 4000  # 检索结果最大字符数（已有的限制）
-    _MAX_HISTORY_ROUNDS = 10       # 最多保留轮数
-
-    def _get_conversation(self, conversation_id: str) -> list[dict]:
-        """获取对话历史（内存 → 文件回退加载）"""
-        if conversation_id in self._conversations:
-            return self._conversations[conversation_id]
-
-        # 尝试从文件加载
-        filepath = CONVERSATIONS_DIR / f"{conversation_id}.json"
-        if filepath.exists():
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._conversations[conversation_id] = data
-                logger.info(f"[Conv] 从文件加载对话: {conversation_id[-8:]}, "
-                            f"{len(data)} 条消息")
-                return data
-            except Exception as e:
-                logger.warning(f"[Conv] 加载失败 {filepath}: {e}")
-
-        # 新建空对话
-        self._conversations[conversation_id] = []
-        return self._conversations[conversation_id]
-
-    def _save_conversation(self, conversation_id: str):
-        """持久化对话到 JSON 文件"""
-        conv = self._conversations.get(conversation_id, [])
-        if not conv:
-            return
-        filepath = CONVERSATIONS_DIR / f"{conversation_id}.json"
-        try:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(conv, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"[Conv] 保存失败: {e}")
-
-    def _add_to_conversation(
-        self, conversation_id: str, role: str, content: str
-    ):
-        """添加消息到对话历史（内存 + 文件持久化）"""
-        conv = self._get_conversation(conversation_id)
-        conv.append({"role": role, "content": content})
-        # 保留最近 N 轮
-        max_messages = self._MAX_HISTORY_ROUNDS * 2
-        if len(conv) > max_messages:
-            self._conversations[conversation_id] = conv[-max_messages:]
-        # 异步持久化（fire-and-forget，不阻塞查询）
-        self._save_conversation(conversation_id)
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
         """粗略估算 token 数（中英混合：约 1 字符 ≈ 0.6 token）"""
         if not text:
             return 0
-        # 中文约占 0.7 token/char，英文约占 0.25 token/char
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         other_chars = len(text) - chinese_chars
         return int(chinese_chars * 0.7 + other_chars * 0.25)
 
-    def _format_history_with_budget(
-        self, history: list[dict], max_chars: int
+    @staticmethod
+    def _tokens_to_chars(tokens: int) -> int:
+        """token 预算转换为字符预算（粗略）"""
+        return int(tokens / 0.4)  # 平均 1 token ≈ 0.4 中文字符 ≈ 4 英文字符
+
+    def _compute_context_budgets(self) -> dict:
+        """根据 LLM 窗口上限动态计算各级上下文预算（返回字符数）"""
+        total_token_budget = int(LLM_MAX_CONTEXT_TOKENS * CONTEXT_SAFE_RATIO)
+        total_char_budget = self._tokens_to_chars(total_token_budget)
+
+        return {
+            "total_tokens": total_token_budget,
+            "total_chars": total_char_budget,
+            "l1_chars": int(total_char_budget * CONTEXT_BUDGET_L1_RATIO),
+            "l2_chars": int(total_char_budget * CONTEXT_BUDGET_L2_RATIO),
+            "retrieval_chars": int(total_char_budget * CONTEXT_BUDGET_RETRIEVAL_RATIO),
+            "reserve_chars": int(total_char_budget * CONTEXT_BUDGET_RESERVE_RATIO),
+        }
+
+    # ========================
+    # 多轮对话管理（分层记忆 L1/L2/L3）
+    # ========================
+
+    def _save_conversation(self, conversation_id: str):
+        """持久化对话到 JSON 文件（完整历史 + L2 压缩记忆 + L3 笔记）"""
+        conv = self._conversations.get(conversation_id, [])
+        l2 = self._compressed_memories.get(conversation_id, "")
+        l3 = self._pinned_notes.get(conversation_id, [])
+
+        data = {
+            "version": 2,
+            "messages": conv,
+            "compressed_memory": l2,
+            "pinned_notes": l3,
+        }
+
+        filepath = CONVERSATIONS_DIR / f"{conversation_id}.json"
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"[Conv] 保存失败: {e}")
+
+    def _load_conversation_v2(self, conversation_id: str, data: dict):
+        """加载 v2 格式的持久化对话（含 L2/L3）"""
+        self._conversations[conversation_id] = data.get("messages", [])
+        self._compressed_memories[conversation_id] = data.get("compressed_memory", "")
+        self._pinned_notes[conversation_id] = data.get("pinned_notes", [])
+        # 标记已压缩到消息列表末尾
+        if self._compressed_memories[conversation_id]:
+            self._compressed_until[conversation_id] = len(
+                self._conversations[conversation_id]
+            )
+
+    def _get_conversation(self, conversation_id: str) -> list[dict]:
+        """获取对话历史（内存 → 文件回退加载，支持 v1/v2 格式）"""
+        if conversation_id in self._conversations:
+            return self._conversations[conversation_id]
+
+        filepath = CONVERSATIONS_DIR / f"{conversation_id}.json"
+        if filepath.exists():
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "version" in data:
+                    self._load_conversation_v2(conversation_id, data)
+                else:
+                    self._conversations[conversation_id] = data
+                logger.info(f"[Conv] 从文件加载对话: {conversation_id[-8:]}, "
+                            f"{len(self._conversations[conversation_id])} 条消息")
+                return self._conversations[conversation_id]
+            except Exception as e:
+                logger.warning(f"[Conv] 加载失败 {filepath}: {e}")
+
+        self._conversations[conversation_id] = []
+        return self._conversations[conversation_id]
+
+    def _add_to_conversation(
+        self, conversation_id: str, role: str, content: str
+    ):
+        """
+        添加消息到对话历史（分层记忆持久化）。
+
+        超出 L1 的旧消息自动触发 L2 压缩：
+        - L1: 最近 L1_WORKING_ROUNDS 轮完整保留
+        - L2: 旧轮次用 LLM 提取关键事实（最多 L2_MEDIUM_ROUNDS 轮）
+        - 更早的轮次从磁盘删除
+        """
+        conv = self._get_conversation(conversation_id)
+        conv.append({"role": role, "content": content})
+
+        # 检测是否需要压缩：当前消息数 > L1 容量
+        l1_msg_count = L1_WORKING_ROUNDS * 2
+        total_msg_count = L2_MEDIUM_ROUNDS * 2
+
+        # 如果超出 L2 总量，裁剪到 L2_MEDIUM_ROUNDS
+        if len(conv) > total_msg_count:
+            self._conversations[conversation_id] = conv[-total_msg_count:]
+            self._compressed_until[conversation_id] = 0  # 需要重新压缩
+
+        # 触发异步压缩：超出 L1 的轮次 -> L2
+        if len(conv) > l1_msg_count:
+            self._compress_to_l2(conversation_id)
+
+        self._save_conversation(conversation_id)
+
+    def _compress_to_l2(self, conversation_id: str):
+        """
+        将 L1 之外的旧轮次压缩为 L2 结构化要点。
+        只压缩尚未压缩的部分（增量压缩）。
+        """
+        conv = self._conversations.get(conversation_id, [])
+        l1_msg_count = L1_WORKING_ROUNDS * 2
+
+        if len(conv) <= l1_msg_count:
+            return
+
+        last_compressed = self._compressed_until.get(conversation_id, 0)
+        old_messages = conv[last_compressed:len(conv) - l1_msg_count]
+
+        if not old_messages:
+            return  # 没有新内容需要压缩
+
+        # 构建压缩 prompt
+        history_str = "\n".join(
+            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:300]}"
+            for m in old_messages
+        )
+
+        compress_prompt = (
+            "你是一个对话摘要专家。请从以下对话片段中提取 3-5 条关键事实或结论，"
+            "每条以简洁的一句话表达。只输出要点，不要任何解释。\n\n"
+            f"对话片段：\n{history_str[:3000]}\n\n"
+            "关键要点："
+        )
+
+        try:
+            import openai
+            client = openai.OpenAI(
+                api_key=LLM_API_KEY,
+                base_url=LLM_BASE_URL,
+            )
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": compress_prompt}],
+                max_tokens=MEMORY_COMPRESSION_TOKENS,
+                temperature=0.1,
+                timeout=10,
+            )
+            new_facts = resp.choices[0].message.content.strip()
+
+            # 合并到已有 L2
+            existing = self._compressed_memories.get(conversation_id, "")
+            if existing:
+                self._compressed_memories[conversation_id] = (
+                    existing + "\n" + new_facts
+                )
+            else:
+                self._compressed_memories[conversation_id] = new_facts
+
+            # 标记已压缩位置
+            self._compressed_until[conversation_id] = len(conv) - l1_msg_count
+
+            logger.info(
+                f"[Memory] L2 压缩完成: {len(old_messages)} 条消息 → "
+                f"{len(new_facts)} 字符要点"
+            )
+
+        except Exception as e:
+            logger.warning(f"[Memory] L2 压缩失败: {e}")
+
+    def pin_note(self, conversation_id: str, note: str):
+        """用户置顶一条笔记到 L3"""
+        if conversation_id not in self._pinned_notes:
+            self._pinned_notes[conversation_id] = []
+        if len(self._pinned_notes[conversation_id]) >= L3_PINNED_MAX:
+            self._pinned_notes[conversation_id].pop(0)
+        self._pinned_notes[conversation_id].append(note)
+        self._save_conversation(conversation_id)
+        logger.info(f"[Memory] L3 置顶: {note[:50]}...")
+
+    def unpin_note(self, conversation_id: str, index: int):
+        """移除一条 L3 笔记"""
+        if conversation_id in self._pinned_notes:
+            if 0 <= index < len(self._pinned_notes[conversation_id]):
+                removed = self._pinned_notes[conversation_id].pop(index)
+                self._save_conversation(conversation_id)
+                logger.info(f"[Memory] L3 取消置顶: {removed[:50]}...")
+
+    def _format_layered_memory(
+        self, conversation_id: str, budgets: dict
     ) -> str:
         """
-        按预算格式化对话历史：从最新到最旧纳入，按句子边界截断。
-        超出预算的旧轮次自动丢弃。
+        构建分层记忆的文本表示，注入到 LLM prompt。
+
+        返回格式：
+        【对话历史 - 近期】
+        ...（L1 完整消息）
+        【对话要点回顾】
+        ...（L2 压缩要点）
+        【置顶笔记】
+        ...（L3 用户置顶）
         """
-        if not history:
+        conv = self._conversations.get(conversation_id, [])
+        parts = []
+
+        # L1: 最近 N 轮完整保留
+        if conv:
+            l1_msg_count = L1_WORKING_ROUNDS * 2
+            l1_messages = conv[-l1_msg_count:]
+            l1_text = self._format_messages_with_budget(l1_messages, budgets["l1_chars"])
+            if l1_text:
+                parts.append(f"【对话历史 - 近期】\n{l1_text}")
+
+        # L2: 压缩记忆
+        l2 = self._compressed_memories.get(conversation_id, "")
+        if l2:
+            l2_budget = budgets["l2_chars"]
+            if len(l2) > l2_budget:
+                lines = l2.split("\n")
+                truncated = []
+                used = 0
+                for line in lines:
+                    if used + len(line) > l2_budget:
+                        break
+                    truncated.append(line)
+                    used += len(line) + 1
+                l2 = "\n".join(truncated) + "\n..."
+            parts.append(f"【对话要点回顾】\n{l2}")
+
+        # L3: 用户置顶笔记
+        l3 = self._pinned_notes.get(conversation_id, [])
+        if l3:
+            l3_text = "\n".join(f"- {n}" for n in l3)
+            parts.append(f"【置顶笔记】\n{l3_text}")
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def _format_messages_with_budget(messages: list[dict], max_chars: int) -> str:
+        """按预算格式化最近消息列表，从新到旧逐条纳入"""
+        if not messages:
             return ""
 
-        lines = ["【对话历史】"]
-        used = len(lines[0])
+        lines = []
+        used = 0
 
-        # 从最新到最旧遍历（反转）
-        for msg in reversed(history):
+        for msg in reversed(messages):
             role_label = "用户" if msg["role"] == "user" else "助手"
             content = msg["content"]
 
-            # 按句子边界截断（中英文句号、问号、感叹号、换行）
             if len(content) > 500:
                 truncated = content[:500]
-                # 回退到最近的句子边界
                 match = re.search(
                     r'[。！？.!?\n](?=[^。！？.!?\n]*$)',
                     truncated
@@ -405,7 +605,6 @@ class CrewMultiAgentSystem:
 
             line = f"{role_label}: {content}"
             if used + len(line) > max_chars:
-                # 空间不够 → 标记省略并停止
                 lines.append("...（更早的对话已省略）")
                 break
 
@@ -470,7 +669,7 @@ class CrewMultiAgentSystem:
             return question
 
     # ========================
-    # 直接检索（不经过 LLM）
+    # 检索（含工作集集成）
     # ========================
 
     def _retrieve_directly(self, question: str) -> str:
@@ -479,7 +678,6 @@ class CrewMultiAgentSystem:
         省掉 1 次 LLM API 调用（原 Retriever Agent 的开销）。
         """
         t0 = time.time()
-        # 使用问题本身作为检索查询（混合检索 + 重排序）
         results = self.retriever.retrieve(
             question,
             top_k=8,
@@ -491,6 +689,92 @@ class CrewMultiAgentSystem:
             f"[DirectRetrieve] 命中 {len(results)} 条, 耗时 {elapsed:.2f}s"
         )
         return self.retriever.format_context(results, max_chars=4000)
+
+    def _retrieve_with_working_set(self, question: str, budgets: dict) -> tuple[str, bool]:
+        """
+        结合工作集 Sub-Agent 的检索：
+
+        1. 先查工作集是否已有相关片段
+        2. 命中 → 返回工作集摘要（不调检索器）
+        3. 未命中 → 调检索器拉新片段 → 入队 → 返回工作集摘要
+
+        Returns:
+            (context_text, from_working_set): 上下文文本 + 是否来自工作集
+        """
+        # Step 1: 查询工作集
+        ws_result = self.working_set.query(question)
+        retrieval_chars = budgets["retrieval_chars"]
+
+        if ws_result.hit and ws_result.confidence >= 0.7:
+            # 高置信度命中 → 直接使用工作集摘要
+            ws_summary = ws_result.summary
+            logger.info(
+                f"[WorkingSet] 命中! confidence={ws_result.confidence:.2f}, "
+                f"fragments={len(ws_result.fragments)}"
+            )
+            return ws_summary, True
+
+        # Step 2: 未命中或低置信度 → 检索新片段
+        retrieval_query = ws_result.suggested_query or question
+        logger.info(
+            f"[WorkingSet] {'未命中' if not ws_result.hit else '低置信度补充'}"
+            f" → 检索: {retrieval_query[:50]}..."
+        )
+
+        t0 = time.time()
+        new_results = self.retriever.retrieve(
+            retrieval_query,
+            top_k=6,
+            use_hybrid=True,
+            use_rerank=True,
+        )
+        elapsed = time.time() - t0
+
+        if new_results:
+            # 构建 Fragment 并入队
+            new_fragments = []
+            for r in new_results:
+                # 预计算向量
+                try:
+                    emb = self.embedder.embed_query(r.get("text", "")[:500])
+                except Exception:
+                    emb = [0.0] * self.embedder.dimension
+
+                frag = Fragment(
+                    id=r.get("id", hashlib.md5(r.get("text", "").encode()).hexdigest()),
+                    text=r.get("text", ""),
+                    embedding=emb,
+                    source=r.get("metadata", {}).get("title", "未知来源"),
+                    score=r.get("score", 0.0),
+                )
+                new_fragments.append(frag)
+
+            evicted = self.working_set.add_batch(new_fragments)
+            logger.info(
+                f"[WorkingSet] 入队 {len(new_fragments)} 条"
+                + (f", 驱逐 {len(evicted)} 条" if evicted else "")
+                + f", 耗时 {elapsed:.2f}s"
+            )
+
+            # 重新查询工作集获取摘要
+            ws_result2 = self.working_set.query(question)
+            if ws_result2.hit:
+                return ws_result2.summary, True
+
+        # 兜底：返回传统检索格式
+        fallback = self.retriever.format_context(new_results, max_chars=retrieval_chars)
+        return fallback, False
+
+    def _format_retrieval_context(
+        self, context_text: str, budgets: dict, from_working_set: bool
+    ) -> str:
+        """格式化检索上下文，按预算截断"""
+        retrieval_chars = budgets["retrieval_chars"]
+        if len(context_text) > retrieval_chars:
+            context_text = context_text[:retrieval_chars] + "\n..."
+        if from_working_set:
+            return context_text
+        return f"【检索到的文献】\n{context_text}"
 
     # ========================
     # 异步辅助
@@ -536,27 +820,22 @@ class CrewMultiAgentSystem:
         """
         用户提问接口（非流式），使用 CrewAI 编排多 Agent 协作。
 
-        Args:
-            question: 用户问题
-            enable_review: 是否启用审查 Agent
-            conversation_id: 多轮对话 ID（可选）
-
-        Returns:
-            综合回答
+        上下文注入：L1 工作记忆 + L2 压缩要点 + L3 置顶笔记 + 工作集摘要
+        Reviewer 获取原始检索结果做事实核查。
         """
-        # 检查缓存
         cached = self._get_from_cache(question, enable_review)
         if cached:
             return cached
 
         logger.info(f"[CrewAI Query] {question[:80]}...")
+        budgets = self._compute_context_budgets()
 
-        # 获取并加载对话历史
+        # 获取对话历史
         history = []
         if conversation_id:
             history = self._get_conversation(conversation_id)
 
-        # 查询改写 + 检索
+        # 查询改写
         retrieval_question = question
         if history:
             import asyncio as _asyncio
@@ -568,22 +847,34 @@ class CrewMultiAgentSystem:
             finally:
                 loop.close()
 
-        # 直接检索
-        retrieve_text = self._retrieve_directly(retrieval_question)
+        # 检索（含工作集）
+        retrieve_text, from_ws = self._retrieve_with_working_set(retrieval_question, budgets)
+        retrieve_context = self._format_retrieval_context(retrieve_text, budgets, from_ws)
 
-        # 按预算构建对话历史上下文
-        history_text = ""
-        if history:
-            history_text = self._format_history_with_budget(
-                history, self._HISTORY_BUDGET_CHARS
-            )
+        # 分层记忆
+        memory_text = ""
+        if conversation_id:
+            memory_text = self._format_layered_memory(conversation_id, budgets)
 
-        # 构建分析任务
+        # Reviewer 获取原始检索结果（不经过工作集摘要）
+        raw_retrieve = self._retrieve_directly(retrieval_question)
+        raw_budget = budgets["retrieval_chars"]
+        if len(raw_retrieve) > raw_budget:
+            raw_retrieve = raw_retrieve[:raw_budget] + "\n..."
+
+        # 构建含原始文献的 review task
+        review_with_sources_desc = (
+            self.review_task.description +
+            f"\n\n【原始文献片段（用于事实核查）】\n{raw_retrieve}\n\n"
+            f"【待审查的分析报告】\n"
+        )
+
+        # 构建任务
         from crewai import Task as CTask
         analyze_desc = (
             self.analyze_task.description +
-            (f"\n{history_text}" if history_text else "") +
-            f"\n\n【检索到的文献】\n{retrieve_text}"
+            (f"\n{memory_text}" if memory_text else "") +
+            f"\n\n{retrieve_context}"
         )
         analyze_t = CTask(
             description=analyze_desc,
@@ -592,18 +883,39 @@ class CrewMultiAgentSystem:
         )
 
         if enable_review:
+            review_t = CTask(
+                description=review_with_sources_desc,
+                expected_output=self.review_task.expected_output,
+                agent=self.reviewer_agent,
+            )
+            synth_t = CTask(
+                description=(
+                    self.synthesize_with_review_task.description +
+                    (f"\n{memory_text}" if memory_text else "") +
+                    f"\n\n{retrieve_context}"
+                ),
+                expected_output=self.synthesize_with_review_task.expected_output,
+                agent=self.synthesizer_agent,
+            )
             crew = Crew(
-                agents=[self.analyst_agent, self.reviewer_agent,
-                        self.synthesizer_agent],
-                tasks=[analyze_t, self.review_task,
-                       self.synthesize_with_review_task],
+                agents=[self.analyst_agent, self.reviewer_agent, self.synthesizer_agent],
+                tasks=[analyze_t, review_t, synth_t],
                 process=Process.sequential,
                 verbose=True,
             )
         else:
+            synth_t = CTask(
+                description=(
+                    self.synthesize_no_review_task.description +
+                    (f"\n{memory_text}" if memory_text else "") +
+                    f"\n\n{retrieve_context}"
+                ),
+                expected_output=self.synthesize_no_review_task.expected_output,
+                agent=self.synthesizer_agent,
+            )
             crew = Crew(
                 agents=[self.analyst_agent, self.synthesizer_agent],
-                tasks=[analyze_t, self.synthesize_no_review_task],
+                tasks=[analyze_t, synth_t],
                 process=Process.sequential,
                 verbose=True,
             )
@@ -619,10 +931,7 @@ class CrewMultiAgentSystem:
 
         final_text = result.raw if hasattr(result, "raw") else str(result)
 
-        # 保存到缓存
         self._set_to_cache(question, enable_review, final_text)
-
-        # 保存到对话历史
         if conversation_id:
             self._add_to_conversation(conversation_id, "user", question)
             self._add_to_conversation(conversation_id, "assistant", final_text)
@@ -639,8 +948,10 @@ class CrewMultiAgentSystem:
         流式查询：逐 Agent 返回进度和结果。
 
         优化点：
-        - 检索直接执行（不经过 LLM Agent），省 1 次 LLM 调用
-        - 支持多轮对话上下文
+        - 检索含工作集 Sub-Agent（命中时省掉检索调用）
+        - 分层记忆（L1/L2/L3）替代扁平截断
+        - 自适应上下文预算
+        - Reviewer 获取原始检索结果做事实核查
         - 支持结果缓存
 
         Yields:
@@ -659,8 +970,7 @@ class CrewMultiAgentSystem:
             logger.info("[Stream] 缓存命中，直接返回")
             metrics.count("cache_hit")
             metrics.record_timing("total", time.time() - t_total)
-            yield {"type": "progress", "agent": "Cache",
-                   "status": "命中缓存，直接返回结果"}
+            yield {"type": "progress", "agent": "Cache", "status": "命中缓存，直接返回结果"}
             yield {"type": "result", "content": cached}
             return
 
@@ -670,36 +980,53 @@ class CrewMultiAgentSystem:
                    "content": "知识库为空，尚未导入任何论文。请先在左侧边栏点击「更新知识库」或「论文入链」。"}
             return
 
-        # 获取并加载对话历史
+        # 计算自适应预算
+        budgets = self._compute_context_budgets()
+
+        # 获取对话历史
         history = []
         if conversation_id:
             history = self._get_conversation(conversation_id)
 
         # ============================================================
-        # Step 0: 查询改写（利用对话历史补全省略式追问）
+        # Step 0: 查询改写
         # ============================================================
         retrieval_question = question
         if history:
             t_rewrite = time.time()
-            retrieval_question = await self._rewrite_for_retrieval(
-                question, history
-            )
+            retrieval_question = await self._rewrite_for_retrieval(question, history)
             metrics.record_timing("rewrite", time.time() - t_rewrite)
 
         # ============================================================
-        # Step 1: 直接检索（使用改写后的查询，不经过 LLM）
+        # Step 1: 检索（含工作集 Sub-Agent）
         # ============================================================
         yield {"type": "progress", "agent": "Retriever",
-               "status": "正在混合检索知识库（向量 + BM25 + 重排序）..."}
+               "status": "正在查询工作集 + 混合检索知识库（向量 + BM25 + 重排序）..."}
 
         import asyncio
         t_retrieve = time.time()
-        retrieve_text = await asyncio.to_thread(
-            self._retrieve_directly, retrieval_question
+        retrieve_text, from_ws = await asyncio.to_thread(
+            self._retrieve_with_working_set, retrieval_question, budgets
         )
+        retrieve_context = self._format_retrieval_context(retrieve_text, budgets, from_ws)
         metrics.record_timing("retrieve", time.time() - t_retrieve)
         yield {"type": "agent_done", "agent": "Retriever",
                "preview": retrieve_text[:200]}
+
+        # ============================================================
+        # 分层记忆
+        # ============================================================
+        memory_text = ""
+        if conversation_id:
+            memory_text = self._format_layered_memory(conversation_id, budgets)
+
+        # Reviewer 用原始检索结果（不经过工作集摘要）
+        raw_retrieve = await asyncio.to_thread(
+            self._retrieve_directly, retrieval_question
+        )
+        raw_budget = budgets["retrieval_chars"]
+        if len(raw_retrieve) > raw_budget:
+            raw_retrieve = raw_retrieve[:raw_budget] + "\n..."
 
         # ============================================================
         # Step 2: Analyze
@@ -707,48 +1034,38 @@ class CrewMultiAgentSystem:
         yield {"type": "progress", "agent": "Analyst",
                "status": "正在深度分析检索到的文献..."}
 
-        # 按预算构建对话历史上下文
-        history_text = ""
-        if history:
-            history_text = self._format_history_with_budget(
-                history, self._HISTORY_BUDGET_CHARS
-            )
-
         analyze_desc = (
             self.analyze_task.description +
-            (f"\n{history_text}" if history_text else "") +
-            f"\n\n【检索到的文献】\n{retrieve_text}"
+            (f"\n{memory_text}" if memory_text else "") +
+            f"\n\n{retrieve_context}"
         )
         t_analyze = time.time()
         analyze_text = await self._run_agent_step(
-            self.analyst_agent, analyze_desc,
-            {"question": question}, "Analyst"
+            self.analyst_agent, analyze_desc, {"question": question}, "Analyst"
         )
         metrics.record_timing("analyze", time.time() - t_analyze)
         metrics.count("llm_call")
-        yield {"type": "agent_done", "agent": "Analyst",
-               "preview": analyze_text[:200]}
+        yield {"type": "agent_done", "agent": "Analyst", "preview": analyze_text[:200]}
 
         # ============================================================
-        # Step 3: Review（可选）
+        # Step 3: Review（可选，含原始文献做事实核查）
         # ============================================================
         if enable_review:
             yield {"type": "progress", "agent": "Reviewer",
-                   "status": "正在审查分析报告的质量..."}
+                   "status": "正在审查分析报告的质量（含原始文献核查）..."}
 
             review_desc = (
                 self.review_task.description +
-                f"\n\n【待审查的分析报告】\n{analyze_text}"
+                f"\n\n【原始文献片段（用于事实核查）】\n{raw_retrieve}\n\n"
+                f"【待审查的分析报告】\n{analyze_text}"
             )
             t_review = time.time()
             review_text = await self._run_agent_step(
-                self.reviewer_agent, review_desc,
-                {}, "Reviewer"
+                self.reviewer_agent, review_desc, {}, "Reviewer"
             )
             metrics.record_timing("review", time.time() - t_review)
             metrics.count("llm_call")
-            yield {"type": "agent_done", "agent": "Reviewer",
-                   "preview": review_text[:200]}
+            yield {"type": "agent_done", "agent": "Reviewer", "preview": review_text[:200]}
 
             # ---- Step 4: Synthesize ----
             yield {"type": "progress", "agent": "Synthesizer",
@@ -756,8 +1073,8 @@ class CrewMultiAgentSystem:
 
             synth_desc = (
                 self.synthesize_with_review_task.description +
-                (f"\n{history_text}" if history_text else "") +
-                f"\n\n【检索结果】\n{retrieve_text}\n\n"
+                (f"\n{memory_text}" if memory_text else "") +
+                f"\n\n{retrieve_context}\n\n"
                 f"【分析报告】\n{analyze_text}\n\n"
                 f"【审查意见】\n{review_text}"
             )
@@ -766,15 +1083,14 @@ class CrewMultiAgentSystem:
                    "status": "正在综合结果生成回答..."}
             synth_desc = (
                 self.synthesize_no_review_task.description +
-                (f"\n{history_text}" if history_text else "") +
-                f"\n\n【检索结果】\n{retrieve_text}\n\n"
+                (f"\n{memory_text}" if memory_text else "") +
+                f"\n\n{retrieve_context}\n\n"
                 f"【分析报告】\n{analyze_text}"
             )
 
         t_synth = time.time()
         final_text = await self._run_agent_step(
-            self.synthesizer_agent, synth_desc,
-            {"question": question}, "Synthesizer"
+            self.synthesizer_agent, synth_desc, {"question": question}, "Synthesizer"
         )
         metrics.record_timing("synthesize", time.time() - t_synth)
         metrics.count("llm_call")
@@ -786,13 +1102,12 @@ class CrewMultiAgentSystem:
             "conversation_id": conversation_id[-8:] if conversation_id else None,
             "enable_review": enable_review,
             "rewritten": retrieval_question != question,
+            "from_working_set": from_ws,
             "total_s": round(time.time() - t_total, 2),
         })
 
-        # 保存到缓存
+        # 保存
         self._set_to_cache(question, enable_review, final_text)
-
-        # 保存到对话历史
         if conversation_id:
             self._add_to_conversation(conversation_id, "user", question)
             self._add_to_conversation(conversation_id, "assistant", final_text)
